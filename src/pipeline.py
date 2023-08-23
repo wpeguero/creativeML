@@ -1,5 +1,6 @@
 """
-Pipeline
+Pipeline.
+
 --------
 
 
@@ -9,15 +10,27 @@ analyze.
 """
 import re
 import numpy as np
-from keras.utils import np_utils
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.preprocessing.text import Tokenizer
 
 def _main():
-    pass
+    filename = "./data/aesop_tales.txt"
+    with open(filename, encoding='utf-8-sig') as f:
+        text = f.read()
+    seq_length = 20
+    start_story = "|" * seq_length
+    text = clean_text(text)
+    # Tokenization
+    tokenizer = Tokenizer(char_level=False, filters='')
+    tokenizer.fit_on_texts([text])
+    total_words = len(tokenizer.word_index) + 1
+    token_list = tokenizer.texts_to_sequences([text])[0]
 
 
-def clean_text(text:str, pad:str = '<pad>') -> str:
+def clean_text(text:str, pad:str = '|') -> str:
     """
     Clean Text to ASCII standard.
+
     -----------------------------
 
     Remove any special characters that do not add or
@@ -38,7 +51,7 @@ def clean_text(text:str, pad:str = '<pad>') -> str:
     """
     text = text.lower()
     text = pad + text
-    text = re.sub(r'\n{4,}', pad, text)
+    text = re.sub(r'\n{4,}', pad, text) # Need to change this
     text = text.replace('\n\n', '. ')
     text = text.replace('\n', ' ')
     text = text.replace(".'.", ".'")
@@ -50,10 +63,10 @@ def clean_text(text:str, pad:str = '<pad>') -> str:
     text = text.replace(' . ', '. ')
     return text
 
-def create_vocabulary(text:str, delimiter:str=" ", pad:str="<pad>") -> list, dict:
+def create_vocabulary(text:str, delimiter:str=" ", pad:str="<pad>"):
     """
-    Create a dictionary containing all of the words within
-    the raw raw text indexed by numbers.
+    Create a dictionary containing all of the words within the raw raw text indexed by numbers.
+
     ...
 
     Separates the words found within the clean body of text
@@ -81,6 +94,7 @@ def create_vocabulary(text:str, delimiter:str=" ", pad:str="<pad>") -> list, dic
 def generate_sequences(tokens:list, sequence_length:int, step:int):
     """
     Generate the dataset based on sequences of words.
+
     ...
 
     Uses a list of tokens to create the dataset by indexing
@@ -100,12 +114,14 @@ def generate_sequences(tokens:list, sequence_length:int, step:int):
     X = []
     y = []
 
-    for i in range(0, len(tokens) - sequence_length, step):
+    for i in range(0, len(set(tokens)) + 1 - sequence_length, step):
         X.append(tokens[i:i + sequence_length])
         y.append(tokens[i + sequence_length])
 
-    y = np_utils.to_categorical(y, num_classes = set(tokens))
+    y = to_categorical(y, num_classes = len(set(tokens)) + 1)
     num_seq = len(X)
+    X = np.asarray(X)
+    y = np.asarray(y)
     return X, y, num_seq
 
 
