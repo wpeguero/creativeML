@@ -16,9 +16,10 @@ from tensorflow.keras.models import load_model
 import json
 
 PAD = '| '
+version=20
 
 def _main():
-    model = load_model("models/model_v18")
+    model = load_model("models/model_v{}".format(version))
     word = "The frog and the fox."
     next_words = 500
     filename = "./data/aesop_tokenizer.json"
@@ -26,8 +27,12 @@ def _main():
         json_tokenizer = json.load(f)
         f.close()
     tokenizer = tokenizer_from_json(json_tokenizer)
-    text = generate_text(word, next_words, model, tokenizer, temp=0.2)
-    print(text)
+    text = generate_text(word, next_words, model, tokenizer, temp=0.5)
+    temps = [0.2, 0.5, 0.8, 1.0]
+    texts = {str(t):generate_text(word, next_words, model, tokenizer, temp=t) for t in temps}
+    print(f"version {version}")
+    for key, value in texts.items():
+        print(f"Text generated at temp={key}\n\n{value}\n")
 
 
 def clean_text(text:str, pad:str = '|') -> str:

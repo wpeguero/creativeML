@@ -10,16 +10,15 @@ generative models.
 from tensorflow.keras.layers import Dense, LSTM, Input, Embedding, Dropout
 from tensorflow.keras.models import Model
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
-from tensorflow.keras.optimizers import RMSprop, Adafactor
+from tensorflow.keras.optimizers import RMSprop, Nadam
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.utils import plot_model
 import numpy as np
 import random
-from pipeline import clean_text, generate_sequences
+from pipeline import clean_text, generate_sequences, version
 
-EPOCHS = 1_000
+EPOCHS = 130
 BATCH= 32
-version=18
 
 def _main():
     filename = "./data/aesop_tales.txt"
@@ -39,7 +38,7 @@ def _main():
     print(total_words)
     # Parameters
     n_units = 512
-    embedding_size = 200
+    embedding_size = 220
     # build Dataset
     X, y, num_seq = generate_sequences(token_list,sequence_length=seq_length, step=1)
     # Build Model
@@ -64,7 +63,7 @@ def TextGenerator(total_words:int, embedding_size:int, n_units:int):
     text_in = Input(shape=(None,))
     x = Embedding(total_words, embedding_size)(text_in)
     x = LSTM(n_units, return_sequences=True)(x)
-    x = LSTM(int(n_units * 2))(x)
+    x = LSTM(int(n_units * 4))(x)
     x = Dropout(0.3)(x)
     text_out = Dense(total_words, activation='softmax')(x)
     model = Model(text_in, text_out)
