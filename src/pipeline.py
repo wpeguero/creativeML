@@ -10,29 +10,43 @@ analyze.
 """
 import re
 import numpy as np
+import pandas as pd
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.preprocessing.text import Tokenizer, tokenizer_from_json
 from tensorflow.keras.models import load_model
 import json
+import string
+from tf_agents.environments import py_environment, tf_environment, tf_py_environment, utils, wrappers, suite_gym
+from tf_agents.specs import array_spec
+from tf_agents.trajectories import time_step as ts
 
 PAD = '| '
-version=20
+version=21
 
 def _main():
-    model = load_model("models/model_v{}".format(version))
-    word = "The frog and the fox."
-    next_words = 500
-    filename = "./data/aesop_tokenizer.json"
-    with open(filename, encoding='utf-8') as f:
-        json_tokenizer = json.load(f)
-        f.close()
-    tokenizer = tokenizer_from_json(json_tokenizer)
-    text = generate_text(word, next_words, model, tokenizer, temp=0.5)
-    temps = [0.2, 0.5, 0.8, 1.0]
-    texts = {str(t):generate_text(word, next_words, model, tokenizer, temp=t) for t in temps}
-    print(f"version {version}")
-    for key, value in texts.items():
-        print(f"Text generated at temp={key}\n\n{value}\n")
+    environment = HangmanEnvironment("hello")
+    utils.validate_py_environment(environment, episodes=5)
+    exit()
+    with open("data/words_250000_train.txt", 'r') as fp:
+        vocab = fp.readlines()
+        fp.close()
+    dataset = list()
+    for word in vocab:
+        word = word.replace("\n", "")
+        iword = word
+        combo = dict()
+        for letter in string.ascii_lowercase:
+            if letter in word:
+                word = word.replace(letter, "_")
+                combo[str(letter)] = word
+                if word == "_"*len(iword):
+                    continue
+            else:
+                continue
+        dataset.append(combo)
+    df = pd.DataFrame(dataset)
+    print(df.head(10))
+    #df.to_csv("data/expanded_words_250_000_train.csv")
 
 
 def clean_text(text:str, pad:str = '|') -> str:
@@ -208,6 +222,77 @@ def generate_text(seed_text:str, next_words:int, model, tokenizer:Tokenizer, msl
         output_text += output_word + ' '
 
     return output_text
+
+def expand_dataset(filename:str) -> list[list]:
+    """Expand the vocabulary based on guesses from hangman."""
+    with open(filename, 'r') as fp:
+        vocab = fp.readlines()
+        fp.close()
+    dataset = list()
+    for word in vocab:
+        word = word.replace("\n", "")
+        iword = word
+        combo = list()
+        for letter in string.ascii_lowercase:
+            combo.append(word)
+            word = word.replace(letter, "_")
+            if word == "_"*len(iword):
+                continue
+        dataset.append(combo)
+    return dataset
+
+class HangmanEnvironment(py_environment.PyEnvironment):
+    """This is the environment within the hangman game will be played."""
+
+    def __init__(self, word): #Fix the shape of the action spec
+        """Initialize the environment."""
+        self._action_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.int32, minimum=0, maximum=25, name="action")
+        self._observation_spec = array_spec.BoundedArraySpec(shape=(1,len(word)), dtype=np.int32, minimum=0, maximum=26,name='observation')
+        self._state = [0] * (len(word)+1)
+        self._episode_ended = False
+        self.word = word
+        abcs = dict()
+        for i, letter in enumerate(string.ascii_lowercase):
+            abcs[letter] = i
+        self.abc = abcs
+
+    def action_spec(self):
+        return self._action_spec
+
+    def observation_spec(self):
+        return self._observation_spec
+
+    def _reset(self):
+        self._episode_ended = False
+        self._state = [0] * len(self.word)
+        return ts.restart(np.array([self._state], dtype=np.int32))
+
+    def _step(self, action):
+        if self._state[-1] == 10:
+            self._episode_ended = True
+            return ts.termination(np.array([self._state], dtype=np.int32 ), reward=0.0)
+        else:
+            pass
+        if self._episode_ended:
+            return self.reset()
+        sword = [self.abc[letter] for letter in self.word]
+        if action in sword:
+            indexes = {i:l for i, l in enumerate(self.word) if l == self.abc[l]}
+            for i in indexes.keys():
+                self._state[i] = indexes[i]
+            reward = len(indexes) / len(self.word)
+            print("action is in sword.")
+            return ts.transition(np.array([self._state], dtype=np.int32), reward)
+        elif self._state[:-1] == sword:
+            self._episode_ended = True
+            final_reward = 1.0 - self._state[-1]/10
+            print("Action has ended.")
+            return ts.termination(np.array([self._state], dtype=np.int32),reward=final_reward)
+        else:
+            self._state[-1] += 1
+            discount = 1 / len(self.word)
+            print("Failed {} times.".format(self._state[-1]))
+            return ts.transition(np.array([self._state], dtype=np.int32), reward=0.0, discount = discount)
 
 
 if __name__ == "__main__":
