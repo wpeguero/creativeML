@@ -8,46 +8,170 @@ A Set of algorithms for cleaning the textual data into
 something that is easier for the computer to read and
 analyze.
 """
+
+import json
+import string
 import re
+from random import randint
+
 import numpy as np
 import pandas as pd
+
+import tensorflow as tf
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.preprocessing.text import Tokenizer, tokenizer_from_json
 from tensorflow.keras.models import load_model
-import json
-import string
+from tensorflow.keras.layers import Dense, LSTM, Input, Embedding, Dropout, GRU
+from tensorflow.keras.models import Model
+
 from tf_agents.environments import py_environment, tf_environment, tf_py_environment, utils, wrappers, suite_gym
-from tf_agents.specs import array_spec
+from tf_agents.specs import array_spec, tensor_spec
+from tf_agents.replay_buffers import reverb_replay_buffer, reverb_utils
 from tf_agents.trajectories import time_step as ts
+from tf_agents.agents.dqn import dqn_agent
+from tf_agents.utils import common
+from tf_agents.networks import sequential
+from tf_agents.drivers import py_driver, dynamic_step_driver
+from tf_agents.policies import py_tf_eager_policy, random_tf_policy
+from tf_agents.metrics import tf_metrics
+import reverb
 
 PAD = '| '
 version=21
 
 def _main():
-    environment = HangmanEnvironment("hello")
-    utils.validate_py_environment(environment, episodes=5)
-    exit()
+    word_list = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape", "honeydew", "kiwi", "lemon"]
+    #utils.validate_py_environment(environment, episodes=20) # Does not pass because the specs are not being followed through
     with open("data/words_250000_train.txt", 'r') as fp:
         vocab = fp.readlines()
         fp.close()
-    dataset = list()
-    for word in vocab:
-        word = word.replace("\n", "")
-        iword = word
-        combo = dict()
-        for letter in string.ascii_lowercase:
-            if letter in word:
-                word = word.replace(letter, "_")
-                combo[str(letter)] = word
-                if word == "_"*len(iword):
-                    continue
-            else:
-                continue
-        dataset.append(combo)
-    df = pd.DataFrame(dataset)
-    print(df.head(10))
-    #df.to_csv("data/expanded_words_250_000_train.csv")
+    vocab = [word.replace("\n", "") for word in vocab]
+    environment = HangmanEnvironment(vocab)
+    word_lengths = [len(word) for word in vocab]
+    print(max(word_lengths))
+    # Hyperparameters
+    num_iterations = 20_000
+    initial_collect_steps = 100
+    collect_steps_per_iteration = 1
+    replay_buffer_max_length = 100_000
 
+    batch_size = 64
+    learning_rate = 1e-3
+    log_interval = 200
+
+    num_eval_episodes = 200
+    eval_interval = 1_000
+    train_env = tf_py_environment.TFPyEnvironment(environment)
+    model = sequential.Sequential([
+        Dense(26, activation="linear", input_shape=()),
+        Dense(52, activation="linear"),
+        Dense(26, activation="softmax")
+        ], input_spec=tf.TensorSpec(shape=(50)))
+
+    train_step_counter = tf.Variable(0)
+    opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    agent = dqn_agent.DqnAgent(
+            train_env.time_step_spec(),
+            train_env.action_spec(),
+            q_network = model,
+            optimizer=opt,
+            td_errors_loss_fn=common.element_wise_squared_loss,
+            train_step_counter=train_step_counter
+            )
+    agent.initialize()
+    eval_policy = agent.policy
+    collect_policy = agent.collect_policy
+
+    ## Get Replay Buffer
+    table_name = 'uniform_table'
+    replay_buffer_signature = tensor_spec.from_spec(agent.collect_data_spec)
+    replay_buffer_signature = tensor_spec.add_outer_dim(replay_buffer_signature)
+
+    table = reverb.Table(
+        table_name,
+        max_size=replay_buffer_max_length,
+        sampler=reverb.selectors.Uniform(),
+        remover=reverb.selectors.Fifo(),
+        rate_limiter=reverb.rate_limiters.MinSize(1),
+        signature=replay_buffer_signature)
+
+    reverb_server = reverb.Server([table])
+
+    train_metrics = [
+            tf_metrics.NumberOfEpisodes(),
+            tf_metrics.EnvironmentSteps(),
+            tf_metrics.AverageReturnMetric(),
+            tf_metrics.AverageEpisodeLengthMetric()
+            ]
+    replay_buffer = reverb_replay_buffer.ReverbReplayBuffer(
+        agent.collect_data_spec,
+        table_name=table_name,
+        sequence_length=2,
+        local_server=reverb_server)
+
+    rb_observer = reverb_utils.ReverbAddTrajectoryObserver(
+      replay_buffer.py_client,
+      table_name,
+      sequence_length=2)
+
+    ## Train the agent
+
+    # (Optional) Optimize by wrapping some of the code in a graph using TF function.
+    agent.train = common.function(agent.train)
+
+    # Reset the train step.
+    agent.train_step_counter.assign(0)
+
+    # Evaluate the agent's policy once before training.
+
+    # Reset the environment.
+    time_step = train_env.reset()
+
+    # Create a driver to collect experience.
+    #collect_driver = py_driver.PyDriver(
+    #    environment,
+    #    py_tf_eager_policy.PyTFEagerPolicy(
+    #      agent.collect_policy, use_tf_function=True),
+    #    [rb_observer],
+    #    max_steps=collect_steps_per_iteration)
+    collect_driver = dynamic_step_driver.DynamicStepDriver(train_env, collect_policy, observers=[replay_buffer.add_batch] + train_metrics, num_steps=collect_steps_per_iteration)
+
+    for _ in range(num_iterations):
+
+         # Collect a few steps and save to the replay buffer.
+         print(time_step)
+         time_step, _ = collect_driver.run(time_step)
+
+         # Sample a batch of data from the buffer and update the agent's network.
+         experience, unused_info = next(iterator)
+         train_loss = agent.train(experience).loss
+
+         step = agent.train_step_counter.numpy()
+
+         if step % log_interval == 0:
+            print('step = {0}: loss = {1}'.format(step, train_loss))
+
+         #if step % eval_interval == 0:
+         #   avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
+         #   print('step = {0}: Average Return = {1}'.format(step, avg_return))
+         #   returns.append(avg_return)
+
+
+
+def compute_avg_return(environment, policy, num_episodes=10):
+    total_return = 0.0
+    for _ in range(num_episodes):
+        time_step = environment.reset()
+        episode_return = 0.0
+
+        while not time_step.is_last():
+            action_step = policy.action(time_step)
+            time_step = environment.step(action_step.action)
+            episode_return += time_step.reward
+        total_return += episode_return
+
+    avg_return = total_return / num_episodes
+    return avg_return.numpy()[0]
 
 def clean_text(text:str, pad:str = '|') -> str:
     """
@@ -241,20 +365,83 @@ def expand_dataset(filename:str) -> list[list]:
         dataset.append(combo)
     return dataset
 
-class HangmanEnvironment(py_environment.PyEnvironment):
+class HangmanEnvironmentv1(py_environment.PyEnvironment):
     """This is the environment within the hangman game will be played."""
 
-    def __init__(self, word): #Fix the shape of the action spec
+    def __init__(self, vocab:list):
         """Initialize the environment."""
-        self._action_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.int32, minimum=0, maximum=25, name="action")
-        self._observation_spec = array_spec.BoundedArraySpec(shape=(1,len(word)), dtype=np.int32, minimum=0, maximum=26,name='observation')
-        self._state = [0] * (len(word)+1)
+        self.vocab = vocab
+        self.word = np.random.choice(self.vocab)
+        self.observation = [0] * (len(self.word)+1)
         self._episode_ended = False
-        self.word = word
         abcs = dict()
         for i, letter in enumerate(string.ascii_lowercase):
             abcs[letter] = i
         self.abc = abcs
+        self._action_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.int32, minimum=0, maximum=25, name="action")
+        self._observation_spec = array_spec.BoundedArraySpec(shape=(len(self.word) + 1,), dtype=np.int32, minimum=0, maximum=26,name='observation')
+
+    def action_spec(self):
+        return self._action_spec
+
+    def observation_spec(self):
+        self._observation_spec = array_spec.BoundedArraySpec(shape=(len(self.word) + 1,), dtype=np.int32, minimum=0, maximum=26,name='observation')
+        return self._observation_spec
+
+    def _reset(self):
+        #self.word = np.random.choice(self.vocab)
+        self._episode_ended = False
+        return ts.restart(np.array(self.observation, dtype=np.int32))
+
+    def _get_observation(self):
+        observation = np.zeros(len(self.word) + 1, dtype=np.int32)
+
+
+    def _step(self, action):
+        if self._episode_ended:
+            print(" ")
+            print(self.word)
+            print(" ")
+            return self.reset()
+
+        if self.observation[-1] == 10:
+            self._episode_ended = True
+            return ts.termination(np.array(self.observation, dtype=np.int32), reward=0.0)
+        else:
+            pass
+        sword = [self.abc[letter] for letter in self.word]
+        if action in sword:
+            indexes = {i:l for i, l in enumerate(self.word) if l == self.abc[l]}
+            for i in indexes.keys():
+                self.observation[i] = indexes[i]
+            reward = len(indexes) / len(self.word)
+            print("action is in sword.")
+            return ts.transition(np.array(self.observation, dtype=np.int32), reward)
+        elif self.observation[:-1] == sword:
+            self._episode_ended = True
+            final_reward = 1.0 - self.observation[-1]/10
+            print("Action has ended.")
+            return ts.termination(np.array(self.observation, dtype=np.int32),reward=final_reward)
+        else:
+            self.observation[-1] += 1
+            discount = 1 / len(self.word)
+            print("Failed {} times.".format(self.observation[-1]))
+            return ts.transition(np.array(self.observation, dtype=np.int32), reward=0.0, discount = discount)
+
+
+class HangmanEnvironment(py_environment.PyEnvironment):
+    def __init__(self, word_list):
+        self._word_list = word_list
+        self._current_word = np.random.choice(word_list)
+        self._guessed_letters = []
+        self._max_attempts = 10
+        self._attempts_left = self._max_attempts
+        self._episode_ended = False
+
+        self._action_spec = array_spec.BoundedArraySpec(
+            shape=(), dtype=np.int32, minimum=0, maximum=25, name="action"
+        )
+        self._observation_spec = array_spec.BoundedArraySpec(shape=(1,len(self._current_word) * 2), dtype=np.float32, minimum=0, maximum=1, name="observation")
 
     def action_spec(self):
         return self._action_spec
@@ -263,37 +450,97 @@ class HangmanEnvironment(py_environment.PyEnvironment):
         return self._observation_spec
 
     def _reset(self):
+        self._current_word = np.random.choice(self._word_list)
+        self._guessed_letters = []
+        self._attempts_left = self._max_attempts
+        observation = np.zeros(len(self._current_word) * 2, dtype=np.float32)
         self._episode_ended = False
-        self._state = [0] * len(self.word)
-        return ts.restart(np.array([self._state], dtype=np.int32))
+        return ts.TimeStep(step_type=ts.StepType.FIRST, reward=0, discount=0, observation=observation)
 
     def _step(self, action):
-        if self._state[-1] == 10:
-            self._episode_ended = True
-            return ts.termination(np.array([self._state], dtype=np.int32 ), reward=0.0)
-        else:
-            pass
         if self._episode_ended:
             return self.reset()
-        sword = [self.abc[letter] for letter in self.word]
-        if action in sword:
-            indexes = {i:l for i, l in enumerate(self.word) if l == self.abc[l]}
-            for i in indexes.keys():
-                self._state[i] = indexes[i]
-            reward = len(indexes) / len(self.word)
-            print("action is in sword.")
-            return ts.transition(np.array([self._state], dtype=np.int32), reward)
-        elif self._state[:-1] == sword:
-            self._episode_ended = True
-            final_reward = 1.0 - self._state[-1]/10
-            print("Action has ended.")
-            return ts.termination(np.array([self._state], dtype=np.int32),reward=final_reward)
+
+        letter = chr(ord('a') + action)
+        if letter in self._guessed_letters:
+            return self._step_invalid()
+
+        self._guessed_letters.append(letter)
+
+        if letter in self._current_word:
+            observation = self._get_observation()
+            if set(self._guessed_letters) == set(self._current_word):
+                return self._step_win(observation)
+            return self._step_valid(observation)
         else:
-            self._state[-1] += 1
-            discount = 1 / len(self.word)
-            print("Failed {} times.".format(self._state[-1]))
-            return ts.transition(np.array([self._state], dtype=np.int32), reward=0.0, discount = discount)
+            self._attempts_left -= 1
+            if self._attempts_left == 0:
+                return self._step_loss()
+            return self._step_invalid()
+
+    def _get_observation(self):
+        observation = np.zeros(len(self._current_word) * 2, dtype=np.float32)
+        for i, letter in enumerate(self._current_word):
+            if letter in self._guessed_letters:
+                observation[i] = 1.0
+            else:
+                observation[i + len(self._current_word)] = 1.0
+        return observation
+
+    def _step_valid(self, observation):
+        return ts.TimeStep(
+            step_type=ts.StepType.MID,
+            reward=1.0,
+            discount=0.0,
+            observation=observation
+        )
+
+    def _step_invalid(self):
+        if self._attempts_left == 0:
+            return self._step_loss()
+        return ts.TimeStep(
+            step_type=ts.StepType.MID,
+            reward=0.0,
+            discount=0.0,
+            observation=self._get_observation()
+        )
+
+    def _step_win(self, observation):
+        self._episode_ended = True
+        return ts.TimeStep(
+            step_type=ts.StepType.LAST,
+            reward=10.0,
+            discount=1.0,
+            observation=observation
+        )
+
+    def _step_loss(self):
+        self._episode_ended = True
+        return ts.TimeStep(
+            step_type=ts.StepType.LAST,
+            reward=-10.0,
+            discount=1.0,
+            observation=self._get_observation()
+        )
 
 
 if __name__ == "__main__":
     _main()
+#if __name__ == "__main__":
+#    word_list = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape", "honeydew", "kiwi", "lemon"]
+#    environment = HangmanEnvironment(word_list)
+#
+#    # Reset the environment to start a new episode
+#    time_step = environment.reset()
+#    print("Initial Observation:", time_step.observation)
+#
+#    # Interact with the environment (e.g., take random actions)
+#    for _ in range(10):
+#        action = np.random.randint(26)  # Random letter (0-25)
+#        time_step = environment.step(action)
+#        print("Action:", chr(ord('a') + action))
+#        print("Reward:", time_step.reward)
+#        print("Observation:", time_step.observation)
+#        if time_step.is_last():
+#            break
+
