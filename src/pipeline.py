@@ -47,8 +47,8 @@ def _main():
         fp.close()
     vocab = [word.replace("\n", "") for word in vocab]
     environment = HangmanEnvironment(vocab)
+    utils.validate_py_environment(environment, episodes=20) # Does not pass because the specs are not being followed through
     word_lengths = [len(word) for word in vocab]
-    print(max(word_lengths))
     # Hyperparameters
     num_iterations = 20_000
     initial_collect_steps = 100
@@ -66,7 +66,7 @@ def _main():
         Dense(26, activation="linear", input_shape=()),
         Dense(52, activation="linear"),
         Dense(26, activation="softmax")
-        ], input_spec=tf.TensorSpec(shape=(50)))
+        ], input_spec=tf.TensorSpec(shape=(27,)))
 
     train_step_counter = tf.Variable(0)
     opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
@@ -155,7 +155,6 @@ def _main():
          #   avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
          #   print('step = {0}: Average Return = {1}'.format(step, avg_return))
          #   returns.append(avg_return)
-
 
 
 def compute_avg_return(environment, policy, num_episodes=10):
@@ -428,20 +427,15 @@ class HangmanEnvironmentv1(py_environment.PyEnvironment):
             print("Failed {} times.".format(self.observation[-1]))
             return ts.transition(np.array(self.observation, dtype=np.int32), reward=0.0, discount = discount)
 
-
 class HangmanEnvironment(py_environment.PyEnvironment):
-    def __init__(self, word_list):
+    def __init__(self, word_list:list):
         self._word_list = word_list
-        self._current_word = np.random.choice(word_list)
-        self._guessed_letters = []
-        self._max_attempts = 10
-        self._attempts_left = self._max_attempts
-        self._episode_ended = False
-
-        self._action_spec = array_spec.BoundedArraySpec(
-            shape=(), dtype=np.int32, minimum=0, maximum=25, name="action"
-        )
-        self._observation_spec = array_spec.BoundedArraySpec(shape=(1,len(self._current_word) * 2), dtype=np.float32, minimum=0, maximum=1, name="observation")
+        self._word = np.random.choice(self._word_list)
+        self._word_list.remove(self._word)
+        self._guessed_letters = set()
+        self._state = np.zeros(27, dtype=np.float32)
+        self._action_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.int32, minimum=0, maximum=25, name='action')
+        self._observation_spec = array_spec.BoundedArraySpec(shape=(27,), dtype=np.float32, minimum=0, maximum=20, name='observation')
 
     def action_spec(self):
         return self._action_spec
@@ -450,78 +444,43 @@ class HangmanEnvironment(py_environment.PyEnvironment):
         return self._observation_spec
 
     def _reset(self):
-        self._current_word = np.random.choice(self._word_list)
-        self._guessed_letters = []
-        self._attempts_left = self._max_attempts
-        observation = np.zeros(len(self._current_word) * 2, dtype=np.float32)
         self._episode_ended = False
-        return ts.TimeStep(step_type=ts.StepType.FIRST, reward=0, discount=0, observation=observation)
+        self._word = np.random.choice(self._word_list)
+        self._word_list.remove(self._word)
+        self._state = np.zeros(27, dtype=np.float32)
+        return ts.restart(self._state)
 
     def _step(self, action):
         if self._episode_ended:
             return self.reset()
+        if self._state[-1] == 10: # Number of Attempts
+            self._episode_ended = True
+            discount = -sum(self._state[:-1]) * self._state[-1]
+            return ts.termination(self._state, reward=discount)
+        if (set(self._guessed_letters) == set(self._word)) & (sum(self._state[:-1]) == len(self._word)):
+            self._episode_ended = True
+            reward = sum(self._state[:-1]) - sum(self._state[:-1]) * self._state[-1]
+            return ts.termination(self._state, reward=reward)
 
         letter = chr(ord('a') + action)
-        if letter in self._guessed_letters:
-            return self._step_invalid()
+        if letter in self._word:
+            pos = ord(letter) - 97
+            self._state[pos] = self._word.count(letter)
+            self._guessed_letters.add(letter)
+            return ts.transition(self._state, reward=1.0, discount=0.0)
+        elif letter not in self._word:
+            self._state[-1] += 1
+            self._guessed_letters.add(letter)
+            return ts.transition(self._state, reward=0.0, discount=0.1*self._state[-1])
 
-        self._guessed_letters.append(letter)
 
-        if letter in self._current_word:
-            observation = self._get_observation()
-            if set(self._guessed_letters) == set(self._current_word):
-                return self._step_win(observation)
-            return self._step_valid(observation)
-        else:
-            self._attempts_left -= 1
-            if self._attempts_left == 0:
-                return self._step_loss()
-            return self._step_invalid()
-
-    def _get_observation(self):
-        observation = np.zeros(len(self._current_word) * 2, dtype=np.float32)
-        for i, letter in enumerate(self._current_word):
-            if letter in self._guessed_letters:
-                observation[i] = 1.0
-            else:
-                observation[i + len(self._current_word)] = 1.0
-        return observation
-
-    def _step_valid(self, observation):
-        return ts.TimeStep(
-            step_type=ts.StepType.MID,
-            reward=1.0,
-            discount=0.0,
-            observation=observation
-        )
-
-    def _step_invalid(self):
-        if self._attempts_left == 0:
-            return self._step_loss()
-        return ts.TimeStep(
-            step_type=ts.StepType.MID,
-            reward=0.0,
-            discount=0.0,
-            observation=self._get_observation()
-        )
-
-    def _step_win(self, observation):
+    def _step_win(self):
         self._episode_ended = True
-        return ts.TimeStep(
-            step_type=ts.StepType.LAST,
-            reward=10.0,
-            discount=1.0,
-            observation=observation
-        )
+        return ts.termination(self._state, reward=1.0)
 
     def _step_loss(self):
         self._episode_ended = True
-        return ts.TimeStep(
-            step_type=ts.StepType.LAST,
-            reward=-10.0,
-            discount=1.0,
-            observation=self._get_observation()
-        )
+        return ts.termination(self._state, reward=-1.0)
 
 
 if __name__ == "__main__":
