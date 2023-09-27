@@ -13,6 +13,7 @@ import json
 import string
 import re
 from random import randint
+import time
 
 import numpy as np
 import pandas as pd
@@ -32,12 +33,12 @@ from tf_agents.agents.dqn import dqn_agent
 from tf_agents.utils import common
 from tf_agents.networks import sequential
 from tf_agents.drivers import py_driver, dynamic_step_driver
-from tf_agents.policies import py_tf_eager_policy, random_tf_policy
+from tf_agents.policies import py_tf_eager_policy, random_tf_policy, PolicySaver
 from tf_agents.metrics import tf_metrics
 import reverb
 
 PAD = '| '
-version=21
+version=5
 
 def _main():
     word_list = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape", "honeydew", "kiwi", "lemon"]
@@ -47,26 +48,31 @@ def _main():
         fp.close()
     vocab = [word.replace("\n", "") for word in vocab]
     environment = HangmanEnvironment(vocab)
-    utils.validate_py_environment(environment, episodes=20) # Does not pass because the specs are not being followed through
+    eval_environment = HangmanEnvironment(word_list)
+    utils.validate_py_environment(environment, episodes=10) # Does not pass because the specs are not being followed through
     word_lengths = [len(word) for word in vocab]
     # Hyperparameters
-    num_iterations = 20_000
-    initial_collect_steps = 100
-    collect_steps_per_iteration = 1
+    num_iterations = len(vocab)
+    initial_collect_steps = 10
+    collect_steps_per_iteration = 10
     replay_buffer_max_length = 100_000
 
     batch_size = 64
     learning_rate = 1e-3
-    log_interval = 200
+    log_interval = 10
 
-    num_eval_episodes = 200
-    eval_interval = 1_000
+    num_eval_episodes = 10
+    eval_interval = 200
     train_env = tf_py_environment.TFPyEnvironment(environment)
+    eval_env = tf_py_environment.TFPyEnvironment(eval_environment)
     model = sequential.Sequential([
-        Dense(26, activation="linear", input_shape=()),
-        Dense(52, activation="linear"),
+        Dense(28, activation="tanh", input_shape=()),
+        Dense(52, activation="tanh"),
+        Dense(104, activation="tanh"),
+        Dense(78, activation="tanh"),
+        Dense(52, activation="tanh"),
         Dense(26, activation="softmax")
-        ], input_spec=tf.TensorSpec(shape=(27,)))
+        ], input_spec=tf.TensorSpec(shape=(28,)))
 
     train_step_counter = tf.Variable(0)
     opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
@@ -125,36 +131,54 @@ def _main():
     # Evaluate the agent's policy once before training.
 
     # Reset the environment.
-    time_step = train_env.reset()
+    time_step = environment.reset()
 
     # Create a driver to collect experience.
-    #collect_driver = py_driver.PyDriver(
-    #    environment,
-    #    py_tf_eager_policy.PyTFEagerPolicy(
-    #      agent.collect_policy, use_tf_function=True),
-    #    [rb_observer],
-    #    max_steps=collect_steps_per_iteration)
-    collect_driver = dynamic_step_driver.DynamicStepDriver(train_env, collect_policy, observers=[replay_buffer.add_batch] + train_metrics, num_steps=collect_steps_per_iteration)
+    collect_driver = py_driver.PyDriver(
+        environment,
+        py_tf_eager_policy.PyTFEagerPolicy(
+          agent.collect_policy, use_tf_function=True),
+        [rb_observer],
+        max_steps=collect_steps_per_iteration)
+    #collect_driver = dynamic_step_driver.DynamicStepDriver(train_env, collect_policy, observers=[replay_buffer.add_batch] + train_metrics, num_steps=collect_steps_per_iteration)
 
-    for _ in range(num_iterations):
+    # Dataset generates trajectories
+    dataset = replay_buffer.as_dataset(num_parallel_calls=3, sample_batch_size=batch_size, num_steps=2).prefetch(3)
+    iterator = iter(dataset)
+    losses = list()
+
+    start = time.time()
+    for _ in range(1_000):
 
          # Collect a few steps and save to the replay buffer.
-         print(time_step)
-         time_step, _ = collect_driver.run(time_step)
+        time_step, _ = collect_driver.run(time_step)
 
          # Sample a batch of data from the buffer and update the agent's network.
-         experience, unused_info = next(iterator)
-         train_loss = agent.train(experience).loss
+        experience, unused_info = next(iterator)
+        train_loss = agent.train(experience).loss
+        losses.append(str(int(train_loss)))
 
-         step = agent.train_step_counter.numpy()
+        step = agent.train_step_counter.numpy()
 
-         if step % log_interval == 0:
-            print('step = {0}: loss = {1}'.format(step, train_loss))
+        #if step % log_interval == 0:
+        #    print('episode = {0}: loss = {1}'.format(step/10, train_loss))
+        if time_step.is_last():
+            print('iteration = {0}: loss = {1}'.format(step, train_loss))
 
-         #if step % eval_interval == 0:
-         #   avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
-         #   print('step = {0}: Average Return = {1}'.format(step, avg_return))
-         #   returns.append(avg_return)
+        #if step % 1000 == 0:
+        #    avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
+        #    print('step = {0}: Average Return = {1}'.format(step, avg_return))
+        #    returns.append(avg_return)
+    # Setup Policy Saver
+    with open("data/policy_{}.txt".format(version), 'w') as fp:
+        fp.writelines(losses)
+        fp.close()
+    end = time.time()
+    time_taken = end - start
+    print("Time taken this loop (in seconds): {}".format(time_taken))
+    print("Time taken this loop (in minutes): {}".format(time_taken/60))
+    saver = PolicySaver(agent.collect_policy, batch_size=None)
+    saver.save("models/policy_{}".format(version))
 
 
 def compute_avg_return(environment, policy, num_episodes=10):
@@ -431,11 +455,12 @@ class HangmanEnvironment(py_environment.PyEnvironment):
     def __init__(self, word_list:list):
         self._word_list = word_list
         self._word = np.random.choice(self._word_list)
-        self._word_list.remove(self._word)
         self._guessed_letters = set()
-        self._state = np.zeros(27, dtype=np.float32)
+        self._state = np.zeros(28, dtype=np.float32)
+        self._state[-1] = len(self._word)
         self._action_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.int32, minimum=0, maximum=25, name='action')
-        self._observation_spec = array_spec.BoundedArraySpec(shape=(27,), dtype=np.float32, minimum=0, maximum=20, name='observation')
+        self._observation_spec = array_spec.BoundedArraySpec(shape=(28,), dtype=np.float32, minimum=0, maximum=20, name='observation')
+        self._discount_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.float32, minimum=0.0, maximum=10.0, name='discount')
 
     def action_spec(self):
         return self._action_spec
@@ -445,42 +470,38 @@ class HangmanEnvironment(py_environment.PyEnvironment):
 
     def _reset(self):
         self._episode_ended = False
-        self._word = np.random.choice(self._word_list)
-        self._word_list.remove(self._word)
-        self._state = np.zeros(27, dtype=np.float32)
+        self._word = np.random.choice(self._word_list, replace=False)
+        self._state[-2] = int()
+        self._state = np.zeros(28, dtype=np.float32)
+        self._state[-1] = len(self._word)
+        self._guessed_letters = set()
         return ts.restart(self._state)
 
     def _step(self, action):
         if self._episode_ended:
             return self.reset()
-        if self._state[-1] == 10: # Number of Attempts
+        if self._state[-2] == 10: # Lose Case
             self._episode_ended = True
-            discount = -sum(self._state[:-1]) * self._state[-1]
+            discount = (sum(self._state[:-2]) - len(self._word)) / len(self._word)
             return ts.termination(self._state, reward=discount)
-        if (set(self._guessed_letters) == set(self._word)) & (sum(self._state[:-1]) == len(self._word)):
+        if (set(self._guessed_letters) == set(self._word)) & (sum(self._state[:-1]) == len(self._word)): # Win Case
             self._episode_ended = True
-            reward = sum(self._state[:-1]) - sum(self._state[:-1]) * self._state[-1]
+            self._word_list.remove(self._word)
+            reward = (sum(self._state[:-2]) - (sum(self._state[:-2]) * (self._state[-2]/ 10))) / len(self._word)
             return ts.termination(self._state, reward=reward)
 
         letter = chr(ord('a') + action)
-        if letter in self._word:
+        if letter in self._word: # Correct Guess Case
             pos = ord(letter) - 97
             self._state[pos] = self._word.count(letter)
             self._guessed_letters.add(letter)
-            return ts.transition(self._state, reward=1.0, discount=0.0)
-        elif letter not in self._word:
-            self._state[-1] += 1
+            reward = (sum(self._state[:-2]) - self._state[-2]) / len(self._word)
+            return ts.transition(self._state, reward=reward, discount=0.0)
+        elif letter not in self._word: # Incorrect Guess Case
+            self._state[-2] += 1
+            discount = ((len(self._word) - sum(self._state[:-2])) * (self._state[-2] / 10)) / len(self._word)
             self._guessed_letters.add(letter)
-            return ts.transition(self._state, reward=0.0, discount=0.1*self._state[-1])
-
-
-    def _step_win(self):
-        self._episode_ended = True
-        return ts.termination(self._state, reward=1.0)
-
-    def _step_loss(self):
-        self._episode_ended = True
-        return ts.termination(self._state, reward=-1.0)
+            return ts.transition(self._state, reward=0.0, discount=abs(discount))
 
 
 if __name__ == "__main__":
