@@ -8,32 +8,194 @@ A Set of algorithms for cleaning the textual data into
 something that is easier for the computer to read and
 analyze.
 """
+
+import json
+import string
 import re
+from random import randint
+import time
+
 import numpy as np
+import pandas as pd
+
+import tensorflow as tf
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.preprocessing.text import Tokenizer, tokenizer_from_json
 from tensorflow.keras.models import load_model
-import json
+from tensorflow.keras.layers import Dense, LSTM, Input, Embedding, Dropout, GRU
+from tensorflow.keras.models import Model
+
+from tf_agents.environments import py_environment, tf_environment, tf_py_environment, utils, wrappers, suite_gym
+from tf_agents.specs import array_spec, tensor_spec
+from tf_agents.replay_buffers import reverb_replay_buffer, reverb_utils
+from tf_agents.trajectories import time_step as ts
+from tf_agents.agents.dqn import dqn_agent
+from tf_agents.utils import common
+from tf_agents.networks import sequential
+from tf_agents.drivers import py_driver, dynamic_step_driver
+from tf_agents.policies import py_tf_eager_policy, random_tf_policy, PolicySaver
+from tf_agents.metrics import tf_metrics
+import reverb
 
 PAD = '| '
-version=20
+version=10
 
 def _main():
-    model = load_model("models/model_v{}".format(version))
-    word = "The frog and the fox."
-    next_words = 500
-    filename = "./data/aesop_tokenizer.json"
-    with open(filename, encoding='utf-8') as f:
-        json_tokenizer = json.load(f)
-        f.close()
-    tokenizer = tokenizer_from_json(json_tokenizer)
-    text = generate_text(word, next_words, model, tokenizer, temp=0.5)
-    temps = [0.2, 0.5, 0.8, 1.0]
-    texts = {str(t):generate_text(word, next_words, model, tokenizer, temp=t) for t in temps}
-    print(f"version {version}")
-    for key, value in texts.items():
-        print(f"Text generated at temp={key}\n\n{value}\n")
+    word_list = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape", "honeydew", "kiwi", "lemon"]
+    #utils.validate_py_environment(environment, episodes=20) # Does not pass because the specs are not being followed through
+    with open("data/words_250000_train.txt", 'r') as fp:
+        vocab = fp.readlines()
+        fp.close()
+    vocab = [word.replace("\n", "") for word in vocab]
+    environment = HangmanEnvironment(vocab)
+    eval_environment = HangmanEnvironment(word_list)
+    utils.validate_py_environment(environment, episodes=10) # Does not pass because the specs are not being followed through
+    word_lengths = [len(word) for word in vocab]
+    # Hyperparameters
+    num_iterations = len(vocab)
+    initial_collect_steps = 10
+    collect_steps_per_iteration = 10
+    replay_buffer_max_length = 100_000
 
+    batch_size = 64
+    learning_rate = 1e-3
+    log_interval = 10
+
+    num_eval_episodes = 10
+    eval_interval = 200
+    train_env = tf_py_environment.TFPyEnvironment(environment)
+    eval_env = tf_py_environment.TFPyEnvironment(eval_environment)
+    model = sequential.Sequential([
+        Dense(28, activation="tanh", input_shape=()),
+        Dense(52, activation="tanh"),
+        Dense(104, activation="tanh"),
+        Dense(78, activation="tanh"),
+        Dense(52, activation="tanh"),
+        Dense(26, activation="softmax")
+        ], input_spec=tf.TensorSpec(shape=(28,)))
+
+    train_step_counter = tf.Variable(0)
+    opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    agent = dqn_agent.DqnAgent(
+            train_env.time_step_spec(),
+            train_env.action_spec(),
+            q_network = model,
+            optimizer=opt,
+            td_errors_loss_fn=common.element_wise_squared_loss,
+            train_step_counter=train_step_counter
+            )
+    agent.initialize()
+    eval_policy = agent.policy
+    collect_policy = agent.collect_policy
+
+    ## Get Replay Buffer
+    table_name = 'uniform_table'
+    replay_buffer_signature = tensor_spec.from_spec(agent.collect_data_spec)
+    replay_buffer_signature = tensor_spec.add_outer_dim(replay_buffer_signature)
+
+    table = reverb.Table(
+        table_name,
+        max_size=replay_buffer_max_length,
+        sampler=reverb.selectors.Uniform(),
+        remover=reverb.selectors.Fifo(),
+        rate_limiter=reverb.rate_limiters.MinSize(1),
+        signature=replay_buffer_signature)
+
+    reverb_server = reverb.Server([table])
+
+    train_metrics = [
+            tf_metrics.NumberOfEpisodes(),
+            tf_metrics.EnvironmentSteps(),
+            tf_metrics.AverageReturnMetric(),
+            tf_metrics.AverageEpisodeLengthMetric()
+            ]
+    replay_buffer = reverb_replay_buffer.ReverbReplayBuffer(
+        agent.collect_data_spec,
+        table_name=table_name,
+        sequence_length=2,
+        local_server=reverb_server)
+
+    rb_observer = reverb_utils.ReverbAddTrajectoryObserver(
+      replay_buffer.py_client,
+      table_name,
+      sequence_length=2)
+
+    ## Train the agent
+
+    # (Optional) Optimize by wrapping some of the code in a graph using TF function.
+    agent.train = common.function(agent.train)
+
+    # Reset the train step.
+    agent.train_step_counter.assign(0)
+
+    # Evaluate the agent's policy once before training.
+
+    # Reset the environment.
+    time_step = environment.reset()
+
+    # Create a driver to collect experience.
+    collect_driver = py_driver.PyDriver(
+        environment,
+        py_tf_eager_policy.PyTFEagerPolicy(
+          agent.collect_policy, use_tf_function=True),
+        [rb_observer],
+        max_steps=collect_steps_per_iteration)
+    #collect_driver = dynamic_step_driver.DynamicStepDriver(train_env, collect_policy, observers=[replay_buffer.add_batch] + train_metrics, num_steps=collect_steps_per_iteration)
+
+    # Dataset generates trajectories
+    dataset = replay_buffer.as_dataset(num_parallel_calls=3, sample_batch_size=batch_size, num_steps=2).prefetch(3)
+    iterator = iter(dataset)
+    losses = list()
+
+    start = time.time()
+    count = 1
+    for _ in range(num_iterations):
+
+         # Collect a few steps and save to the replay buffer.
+        time_step, _ = collect_driver.run(time_step)
+
+         # Sample a batch of data from the buffer and update the agent's network.
+        experience, unused_info = next(iterator)
+        train_loss = agent.train(experience).loss
+        losses.append(str(int(train_loss)))
+
+        step = agent.train_step_counter.numpy()
+
+        #if step % log_interval == 0:
+        #    print('episode = {0}: loss = {1}'.format(step/10, train_loss))
+        #if (time_step.is_last()): #& (step >= 200_000):
+        #    print('iteration = {0}: loss = {1}'.format(step, train_loss))
+
+        #if step % 1000 == 0:
+        #    avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
+        #    print('step = {0}: Average Return = {1}'.format(step, avg_return))
+        #    returns.append(avg_return)
+    # Setup Policy Saver
+    with open("data/policy_{}.txt".format(version), 'w') as fp:
+        fp.writelines(losses)
+        fp.close()
+    end = time.time()
+    time_taken = end - start
+    print("Time taken this loop (in seconds): {}".format(time_taken))
+    print("Time taken this loop (in minutes): {}".format(time_taken/60))
+    saver = PolicySaver(agent.collect_policy, batch_size=None)
+    saver.save("models/policy_{}".format(version))
+
+
+def compute_avg_return(environment, policy, num_episodes=10):
+    total_return = 0.0
+    for _ in range(num_episodes):
+        time_step = environment.reset()
+        episode_return = 0.0
+
+        while not time_step.is_last():
+            action_step = policy.action(time_step)
+            time_step = environment.step(action_step.action)
+            episode_return += time_step.reward
+        total_return += episode_return
+
+    avg_return = total_return / num_episodes
+    return avg_return.numpy()[0]
 
 def clean_text(text:str, pad:str = '|') -> str:
     """
@@ -209,6 +371,189 @@ def generate_text(seed_text:str, next_words:int, model, tokenizer:Tokenizer, msl
 
     return output_text
 
+def expand_dataset(filename:str) -> list[list]:
+    """Expand the vocabulary based on guesses from hangman."""
+    with open(filename, 'r') as fp:
+        vocab = fp.readlines()
+        fp.close()
+    dataset = list()
+    for word in vocab:
+        word = word.replace("\n", "")
+        iword = word
+        combo = list()
+        for letter in string.ascii_lowercase:
+            combo.append(word)
+            word = word.replace(letter, "_")
+            if word == "_"*len(iword):
+                continue
+        dataset.append(combo)
+    return dataset
+
+class HangmanEnvironmentv1(py_environment.PyEnvironment):
+    """This is the environment within the hangman game will be played."""
+
+    def __init__(self, vocab:list):
+        """Initialize the environment."""
+        self.vocab = vocab
+        self.word = np.random.choice(self.vocab)
+        self.observation = [0] * (len(self.word)+1)
+        self._episode_ended = False
+        abcs = dict()
+        for i, letter in enumerate(string.ascii_lowercase):
+            abcs[letter] = i
+        self.abc = abcs
+        self._action_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.int32, minimum=0, maximum=25, name="action")
+        self._observation_spec = array_spec.BoundedArraySpec(shape=(len(self.word) + 1,), dtype=np.int32, minimum=0, maximum=26,name='observation')
+
+    def action_spec(self):
+        return self._action_spec
+
+    def observation_spec(self):
+        self._observation_spec = array_spec.BoundedArraySpec(shape=(len(self.word) + 1,), dtype=np.int32, minimum=0, maximum=26,name='observation')
+        return self._observation_spec
+
+    def _reset(self):
+        #self.word = np.random.choice(self.vocab)
+        self._episode_ended = False
+        return ts.restart(np.array(self.observation, dtype=np.int32))
+
+    def _get_observation(self):
+        observation = np.zeros(len(self.word) + 1, dtype=np.int32)
+
+
+    def _step(self, action):
+        if self._episode_ended:
+            print(" ")
+            print(self.word)
+            print(" ")
+            return self.reset()
+
+        if self.observation[-1] == 10:
+            self._episode_ended = True
+            return ts.termination(np.array(self.observation, dtype=np.int32), reward=0.0)
+        else:
+            pass
+        sword = [self.abc[letter] for letter in self.word]
+        if action in sword:
+            indexes = {i:l for i, l in enumerate(self.word) if l == self.abc[l]}
+            for i in indexes.keys():
+                self.observation[i] = indexes[i]
+            reward = len(indexes) / len(self.word)
+            print("action is in sword.")
+            return ts.transition(np.array(self.observation, dtype=np.int32), reward)
+        elif self.observation[:-1] == sword:
+            self._episode_ended = True
+            final_reward = 1.0 - self.observation[-1]/10
+            print("Action has ended.")
+            return ts.termination(np.array(self.observation, dtype=np.int32),reward=final_reward)
+        else:
+            self.observation[-1] += 1
+            discount = 1 / len(self.word)
+            print("Failed {} times.".format(self.observation[-1]))
+            return ts.transition(np.array(self.observation, dtype=np.int32), reward=0.0, discount = discount)
+
+class HangmanEnvironment(py_environment.PyEnvironment):
+    def __init__(self, word_list:list):
+        self._guessed_letters = set()
+        self._state = np.zeros(28, dtype=np.float32)
+        self._word_list = word_list
+        if word_list:
+            self._word = np.random.choice(self._word_list)
+            self._state[-1] = len(self._word)
+        else:
+            pass
+        self._action_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.int32, minimum=0, maximum=25, name='action')
+        self._observation_spec = array_spec.BoundedArraySpec(shape=(28,), dtype=np.float32, minimum=0, maximum=20, name='observation')
+        self._discount_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.float32, minimum=0.0, maximum=10.0, name='discount')
+
+    def action_spec(self):
+        return self._action_spec
+
+    def observation_spec(self):
+        return self._observation_spec
+
+    def _reset(self):
+        self._episode_ended = False
+        if "_" in self._word:
+            pass
+        else:
+            self._word = np.random.choice(self._word_list, replace=False)
+            self._state[-2] = int()
+            self._state = np.zeros(28, dtype=np.float32)
+            self._state[-1] = len(self._word)
+            self._guessed_letters = set()
+        return ts.restart(self._state)
+
+    def add_guessed_letters(self, word:str):
+        self._word_list = list()
+        word = word.strip()
+        self._word_list.append(word)
+        self._word = word
+        if " " in word:
+            letters = word.split(" ")
+        else:
+            letters = list(word)
+        if "" in letters:
+            letters.remove("")
+        self._state = np.zeros(28, dtype=np.float32)
+        if (len(letters) == 0) | ((len(letters) == 1) & (" " in letters)):
+            self._state[-1] = len(word)
+            return self
+        else:
+            for letter in set(letters):
+                pos = ord(letter) - 97
+                self._state[pos] = letters.count(letter)
+            return self
+
+    def _step(self, action):
+        if self._episode_ended:
+            return self.reset()
+        if self._state[-2] == 10: # Lose Case
+            self._episode_ended = True
+            discount = (sum(self._state[:-2]) - len(self._word)) / len(self._word)
+            return ts.termination(self._state, reward=discount)
+        letter = chr(ord('a') + action)
+        if (letter in self._guessed_letters) & (letter in self._word):
+            return ts.transition(self._state, reward=0.0, discount=1.0)
+        elif (letter in self._guessed_letters) & (letter not in self._word):
+            self._state[-2] += 1
+            return ts.transition(self._state, reward=0.0, discount=1.0)
+        if (set(self._guessed_letters) == set(self._word)) & (sum(self._state[:-1]) == len(self._word)): # Win Case
+            self._episode_ended = True
+            self._word_list.remove(self._word)
+            reward = (sum(self._state[:-2]) * (1 + (10 - self._state[-2])/10))
+            return ts.termination(self._state, reward=reward)
+
+        if letter in self._word: # Correct Guess Case
+            pos = ord(letter) - 97
+            self._state[pos] = self._word.count(letter)
+            self._guessed_letters.add(letter)
+            reward = (sum(self._state[:-2]) - self._state[-2]) #/ len(self._word)
+            return ts.transition(self._state, reward=reward, discount=0.0)
+        elif letter not in self._word: # Incorrect Guess Case
+            self._state[-2] += 1
+            discount = ((len(self._word) - sum(self._state[:-2])) * (self._state[-2] / 10)) / len(self._word)
+            self._guessed_letters.add(letter)
+            return ts.transition(self._state, reward=0.0, discount=abs(discount))
+
 
 if __name__ == "__main__":
     _main()
+#if __name__ == "__main__":
+#    word_list = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape", "honeydew", "kiwi", "lemon"]
+#    environment = HangmanEnvironment(word_list)
+#
+#    # Reset the environment to start a new episode
+#    time_step = environment.reset()
+#    print("Initial Observation:", time_step.observation)
+#
+#    # Interact with the environment (e.g., take random actions)
+#    for _ in range(10):
+#        action = np.random.randint(26)  # Random letter (0-25)
+#        time_step = environment.step(action)
+#        print("Action:", chr(ord('a') + action))
+#        print("Reward:", time_step.reward)
+#        print("Observation:", time_step.observation)
+#        if time_step.is_last():
+#            break
+

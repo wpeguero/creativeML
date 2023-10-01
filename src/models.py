@@ -7,48 +7,40 @@ Creative Models.
 Set of classes or functions that are used to develop
 generative models.
 """
-from tensorflow.keras.layers import Dense, LSTM, Input, Embedding, Dropout
+from tensorflow.keras.layers import Dense, LSTM, Input, Embedding, Dropout, GRU
 from tensorflow.keras.models import Model
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
-from tensorflow.keras.optimizers import RMSprop, Nadam
+from tensorflow.keras.optimizers import RMSprop, Adam, Adafactor
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.utils import plot_model
+from tensorflow.saved_model import load
 import numpy as np
 import random
-from pipeline import clean_text, generate_sequences, version
+from pipeline import clean_text, generate_sequences, version, HangmanEnvironment
+from tf_agents.environments.tf_py_environment import TFPyEnvironment
+from tf_agents.environments import BatchedPyEnvironment
 
-EPOCHS = 130
+EPOCHS = 1_000
 BATCH= 32
 
 def _main():
-    filename = "./data/aesop_tales.txt"
-    with open(filename, encoding='utf-8') as f:
-        text = f.read()
-    seq_length = 20
-    start_story = "| " * seq_length
-    start = text.find("THE FOX AND THE GRAPES\n\n\n")
-    end = text.find("ILLUSTRATIONS\n\n\n[")
-    text = text[start:end]
-    text = clean_text(text)
-    # Tokenization
-    tokenizer = Tokenizer(char_level=False, filters='')
-    tokenizer.fit_on_texts([text])
-    total_words = len(tokenizer.word_index) + 1
-    token_list = tokenizer.texts_to_sequences([text])[0]
-    print(total_words)
-    # Parameters
-    n_units = 512
-    embedding_size = 220
-    # build Dataset
-    X, y, num_seq = generate_sequences(token_list,sequence_length=seq_length, step=1)
-    # Build Model
-    model = TextGenerator(total_words, embedding_size, n_units)
-    model.compile(optimizer='adam', loss='categorical_crossentropy')
-    plot_model(model, to_file='models/diagrams/model_v{}.png'.format(version), show_shapes=True, show_dtype=True)
-    model.fit(X, y, epochs=EPOCHS, batch_size=BATCH, shuffle=True)
-    model.save('models/model_v{}'.format(version))
+    policy = load("models/policy_{}".format(version))
+    env = HangmanEnvironment(["hello"])
+    tenv = BatchedPyEnvironment([env])
+    env.add_guessed_letters("_ _ _ _ _ _ _ _ _") # goodnight
+    #print(env._guessed_letters)
+    #print(env._state)
+    #exit()
+    test_env = TFPyEnvironment(env)
+    time_step = test_env.reset()
+    for _ in range(20):
+        tstep = policy.action(time_step)
+        time_step = test_env.step(tstep.action[0])
+        print("episode: {}, result: {}".format(_,tstep.action[0]))
+        print(time_step)
 
-def TextGenerator(total_words:int, embedding_size:int, n_units:int):
+
+def text_generator(total_words:int, embedding_size:int, n_units:int):
     """
 
     Model For Designing a Text Generator.
@@ -62,12 +54,56 @@ def TextGenerator(total_words:int, embedding_size:int, n_units:int):
     """
     text_in = Input(shape=(None,))
     x = Embedding(total_words, embedding_size)(text_in)
-    x = LSTM(n_units, return_sequences=True)(x)
-    x = LSTM(int(n_units * 4))(x)
+    x, states = LSTM(n_units, return_sequences=True)(x)
+    x = LSTM(int(n_units * 4), initial_state=states)(x)
     x = Dropout(0.3)(x)
     text_out = Dense(total_words, activation='softmax')(x)
     model = Model(text_in, text_out)
     return model
+
+class TextGenerator(Model):
+    """Simple RNN using LSTM layers."""
+
+    def __init__(self, total_words:int, embedding_dim:int, n_units:int):
+        """Iniitialize the class."""
+        super().__init__(self)
+        self.embedding = Embedding(total_words, embedding_dim)
+        self.lstm1 = LSTM(n_units, return_sequences=True)
+        self.lstm2 = LSTM(int(n_units * 4))
+        self.dropout = Dropout(0.3)
+        self.dense = Dense(total_words, activation='softmax')
+
+    def call(self, inputs):
+        """Call the model for training."""
+        x = inputs
+        x = self.embedding(x)
+        x = self.lstm1(x)
+        x = self.lstm2(x)
+        x = self.dense(x)
+        return x
+
+class SimpleRNN(Model):
+    """Simple Recursive Neural Network using Gated Recurrent Units."""
+
+    def __init__(self, total_words:int, embedding_dim:int, n_units:int):
+        """Initialize the Class."""
+        super().__init__(self)
+        self.embedding = Embedding(total_words, embedding_dim)
+        self.gru = GRU(n_units, return_sequences=True, return_state=True)
+        self.dense = Dense(total_words, activation='softmax')
+
+    def call(self, inputs, states=None, return_state=False, training=False):
+        """Call the model for training."""
+        x = inputs
+        x = self.embedding(x, training=training)
+        if states is None:
+            states = self.gru.get_initial_state(x)
+        x, states = self.gru(x, initial_state=states, training=training)
+        x = self.dens(x, training=training)
+        if return_state:
+            return x, states
+        else:
+            return x
 
 
 if __name__ == "__main__":
