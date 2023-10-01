@@ -38,7 +38,7 @@ from tf_agents.metrics import tf_metrics
 import reverb
 
 PAD = '| '
-version=5
+version=10
 
 def _main():
     word_list = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape", "honeydew", "kiwi", "lemon"]
@@ -148,7 +148,8 @@ def _main():
     losses = list()
 
     start = time.time()
-    for _ in range(1_000):
+    count = 1
+    for _ in range(num_iterations):
 
          # Collect a few steps and save to the replay buffer.
         time_step, _ = collect_driver.run(time_step)
@@ -162,8 +163,8 @@ def _main():
 
         #if step % log_interval == 0:
         #    print('episode = {0}: loss = {1}'.format(step/10, train_loss))
-        if time_step.is_last():
-            print('iteration = {0}: loss = {1}'.format(step, train_loss))
+        #if (time_step.is_last()): #& (step >= 200_000):
+        #    print('iteration = {0}: loss = {1}'.format(step, train_loss))
 
         #if step % 1000 == 0:
         #    avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
@@ -453,11 +454,14 @@ class HangmanEnvironmentv1(py_environment.PyEnvironment):
 
 class HangmanEnvironment(py_environment.PyEnvironment):
     def __init__(self, word_list:list):
-        self._word_list = word_list
-        self._word = np.random.choice(self._word_list)
         self._guessed_letters = set()
         self._state = np.zeros(28, dtype=np.float32)
-        self._state[-1] = len(self._word)
+        self._word_list = word_list
+        if word_list:
+            self._word = np.random.choice(self._word_list)
+            self._state[-1] = len(self._word)
+        else:
+            pass
         self._action_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.int32, minimum=0, maximum=25, name='action')
         self._observation_spec = array_spec.BoundedArraySpec(shape=(28,), dtype=np.float32, minimum=0, maximum=20, name='observation')
         self._discount_spec = array_spec.BoundedArraySpec(shape=(), dtype=np.float32, minimum=0.0, maximum=10.0, name='discount')
@@ -470,12 +474,36 @@ class HangmanEnvironment(py_environment.PyEnvironment):
 
     def _reset(self):
         self._episode_ended = False
-        self._word = np.random.choice(self._word_list, replace=False)
-        self._state[-2] = int()
-        self._state = np.zeros(28, dtype=np.float32)
-        self._state[-1] = len(self._word)
-        self._guessed_letters = set()
+        if "_" in self._word:
+            pass
+        else:
+            self._word = np.random.choice(self._word_list, replace=False)
+            self._state[-2] = int()
+            self._state = np.zeros(28, dtype=np.float32)
+            self._state[-1] = len(self._word)
+            self._guessed_letters = set()
         return ts.restart(self._state)
+
+    def add_guessed_letters(self, word:str):
+        self._word_list = list()
+        word = word.strip()
+        self._word_list.append(word)
+        self._word = word
+        if " " in word:
+            letters = word.split(" ")
+        else:
+            letters = list(word)
+        if "" in letters:
+            letters.remove("")
+        self._state = np.zeros(28, dtype=np.float32)
+        if (len(letters) == 0) | ((len(letters) == 1) & (" " in letters)):
+            self._state[-1] = len(word)
+            return self
+        else:
+            for letter in set(letters):
+                pos = ord(letter) - 97
+                self._state[pos] = letters.count(letter)
+            return self
 
     def _step(self, action):
         if self._episode_ended:
@@ -484,18 +512,23 @@ class HangmanEnvironment(py_environment.PyEnvironment):
             self._episode_ended = True
             discount = (sum(self._state[:-2]) - len(self._word)) / len(self._word)
             return ts.termination(self._state, reward=discount)
+        letter = chr(ord('a') + action)
+        if (letter in self._guessed_letters) & (letter in self._word):
+            return ts.transition(self._state, reward=0.0, discount=1.0)
+        elif (letter in self._guessed_letters) & (letter not in self._word):
+            self._state[-2] += 1
+            return ts.transition(self._state, reward=0.0, discount=1.0)
         if (set(self._guessed_letters) == set(self._word)) & (sum(self._state[:-1]) == len(self._word)): # Win Case
             self._episode_ended = True
             self._word_list.remove(self._word)
-            reward = (sum(self._state[:-2]) - (sum(self._state[:-2]) * (self._state[-2]/ 10))) / len(self._word)
+            reward = (sum(self._state[:-2]) * (1 + (10 - self._state[-2])/10))
             return ts.termination(self._state, reward=reward)
 
-        letter = chr(ord('a') + action)
         if letter in self._word: # Correct Guess Case
             pos = ord(letter) - 97
             self._state[pos] = self._word.count(letter)
             self._guessed_letters.add(letter)
-            reward = (sum(self._state[:-2]) - self._state[-2]) / len(self._word)
+            reward = (sum(self._state[:-2]) - self._state[-2]) #/ len(self._word)
             return ts.transition(self._state, reward=reward, discount=0.0)
         elif letter not in self._word: # Incorrect Guess Case
             self._state[-2] += 1
