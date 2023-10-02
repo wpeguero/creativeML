@@ -7,18 +7,22 @@ Creative Models.
 Set of classes or functions that are used to develop
 generative models.
 """
-from tensorflow.keras.layers import Dense, LSTM, Input, Embedding, Dropout, GRU
-from tensorflow.keras.models import Model
+import tensorflow as tf
+from tensorflow.keras.layers import Dense, LSTM, Input, Embedding, Dropout, GRU, Reshape, Flatten, Conv2D, Conv2DTranspose
+from tensorflow.keras.models import Model, Sequential
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from tensorflow.keras.optimizers import RMSprop, Adam, Adafactor
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.utils import plot_model
 from tensorflow.saved_model import load
-import numpy as np
-import random
-from pipeline import clean_text, generate_sequences, version, HangmanEnvironment
 from tf_agents.environments.tf_py_environment import TFPyEnvironment
 from tf_agents.environments import BatchedPyEnvironment
+
+import numpy as np
+
+import random
+
+from pipeline import clean_text, generate_sequences, version, HangmanEnvironment
 
 EPOCHS = 1_000
 BATCH= 32
@@ -61,6 +65,7 @@ def text_generator(total_words:int, embedding_size:int, n_units:int):
     model = Model(text_in, text_out)
     return model
 
+
 class TextGenerator(Model):
     """Simple RNN using LSTM layers."""
 
@@ -81,6 +86,7 @@ class TextGenerator(Model):
         x = self.lstm2(x)
         x = self.dense(x)
         return x
+
 
 class SimpleRNN(Model):
     """Simple Recursive Neural Network using Gated Recurrent Units."""
@@ -104,6 +110,59 @@ class SimpleRNN(Model):
             return x, states
         else:
             return x
+
+
+class BasicAutoencoder(Model):
+    """
+    Simple Autoencoder for converting images.
+
+    -----------------------------------------
+    The autoencoder functions by inputting the latent dimensions
+    of the image and then proceeding to encode the image. The
+    encoded image is then decoded by the autoencoder and the new
+    processed image is provided.
+    """
+
+    def __init__(self, latent_dim, shape):
+        super(BasicAutoencoder, self).__init__()
+        self.latent_dim = latent_dim
+        self.shape = shape
+        self.encoder = Sequential([
+            Flatten(),
+            Dense(self.latent_dim, activation='relu')
+            ])
+        self.decoder = Sequential([
+            Dense(tf.math.reduce_prod(self.shape), activation='sigmoid'),
+            Reshape(self.shape)
+            ])
+
+    def call(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+
+class Denoise(Model):
+    """Convolutional Autoencoder."""
+
+    def __init__(self, shape:tuple):
+        super(Denoise, self).__init__()
+        self.shape = shape
+        self.encoder = Sequential([
+            Input(shape=self.shape),
+            Conv2D(16, (3,3), activation='relu', padding='same', strides=2),
+            Conv2D(8, (3,3), activation='relu', padding='same', strides=2)
+            ])
+        self.decoder = Sequential([
+            Conv2DTranspose(8, kernel_size=3, strides=2, activation='relu', padding='same'),
+            Conv2DTranspose(16, kernel_size=3, strides=2, activation='relu', padding='same'),
+            Conv2D(1, kernel_size=(3,3), activation='sigmoid', padding='same')
+            ])
+
+    def call(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
 
 
 if __name__ == "__main__":
