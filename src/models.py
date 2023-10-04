@@ -8,7 +8,7 @@ Set of classes or functions that are used to develop
 generative models.
 """
 import tensorflow as tf
-from tensorflow.keras.layers import Dense, LSTM, Input, Embedding, Dropout, GRU, Reshape, Flatten, Conv2D, Conv2DTranspose
+from tensorflow.keras.layers import Dense, LSTM, Input, Embedding, Dropout, GRU, Reshape, Flatten, Conv2D, Conv2DTranspose, BatchNormalization, LeakyReLU
 from tensorflow.keras.models import Model, Sequential
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from tensorflow.keras.optimizers import RMSprop, Adam, Adafactor
@@ -28,20 +28,9 @@ EPOCHS = 1_000
 BATCH= 32
 
 def _main():
-    policy = load("models/policy_{}".format(version))
-    env = HangmanEnvironment(["hello"])
-    tenv = BatchedPyEnvironment([env])
-    env.add_guessed_letters("_ _ _ _ _ _ _ _ _") # goodnight
-    #print(env._guessed_letters)
-    #print(env._state)
-    #exit()
-    test_env = TFPyEnvironment(env)
-    time_step = test_env.reset()
-    for _ in range(20):
-        tstep = policy.action(time_step)
-        time_step = test_env.step(tstep.action[0])
-        print("episode: {}, result: {}".format(_,tstep.action[0]))
-        print(time_step)
+    model = SimpleGenerator()
+    model.build(input_shape=(None, 100))
+    plot_model(model, to_file='models/diagrams/generator.png')
 
 
 def text_generator(total_words:int, embedding_size:int, n_units:int):
@@ -163,6 +152,63 @@ class Denoise(Model):
         encoded = self.encoder(x)
         decoded = self.decoder(encoded)
         return decoded
+
+
+class SimpleGenerator(Model):
+    """Simple Generator."""
+
+    def __init__(self):
+        super(SimpleGenerator, self).__init__()
+        self.dense1 = Dense(7*7*256, use_bias=False)
+        self.batch_norm = BatchNormalization()
+        self.leakyrelu = LeakyReLU()
+        self.reshape = Reshape((7, 7, 256))
+        self.conv2dtranspose1 = Conv2DTranspose(128, (5, 5), strides=(1, 1), padding='same', use_bias=False)
+        self.batch_norm1 = BatchNormalization()
+        self.leakyrelu1 = LeakyReLU()
+        self.conv2dtranspose2 = Conv2DTranspose(64, (5, 5), strides=(2, 2), padding='same', use_bias=False)
+        self.batch_norm2 = BatchNormalization()
+        self.leakyrelu2 = LeakyReLU()
+        self.conv2dtranspose3 = Conv2DTranspose(1, (5, 5), strides=(2, 2), padding='same', use_bias=False)
+
+    def call(self, x):
+        x = self.dense1(x)
+        x = self.batch_norm(x)
+        x = self.leakyrelu(x)
+        x = self.reshape(x)
+        x = self.conv2dtranspose1(x)
+        x = self.batch_norm1(x)
+        x = self.leakyrelu1(x)
+        x = self.conv2dtranspose2(x)
+        x = self.batch_norm2(x)
+        x = self.leakyrelu2(x)
+        x = self.conv2dtranspose3(x)
+        return x
+
+
+class SimpleDiscriminator(Model):
+    """CNN-based image classifier."""
+    def __init__(self):
+        super(SimpleDiscriminator, self).__init__()
+        self.cnn = Conv2D(64, (5, 5), strides=(2, 2), padding='same', input_shape=[28, 28, 1])
+        self.leakyrelu = LeakyReLU()
+        self.dropout = Dropout(0.3)
+        self.cnn1 = Conv2D(128, (5, 5), strides=(2, 2), padding='same')
+        self.leakyrelu1 = LeakyReLU()
+        self.dropout1 = Dropout(0.3)
+        self.flatten = Flatten()
+        self.dense1 = Dense(1)
+
+    def call(self, x):
+        x = self.cnn(x)
+        x = self.leakyrelu(x)
+        x = self.dropout(x)
+        x = self.cnn1(x)
+        x = self.leakyrelu1(x)
+        x = self.dropout1(x)
+        x = self.flatten(x)
+        x = self.dense1(x)
+        return x
 
 
 if __name__ == "__main__":
