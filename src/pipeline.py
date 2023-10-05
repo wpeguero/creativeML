@@ -14,6 +14,7 @@ import string
 import re
 from random import randint
 import time
+import PIL
 
 import numpy as np
 import pandas as pd
@@ -21,9 +22,9 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.preprocessing.text import Tokenizer, tokenizer_from_json
-from tensorflow.keras.models import load_model
+from tensorflow.keras.models import load_model, Model
 from tensorflow.keras.layers import Dense, LSTM, Input, Embedding, Dropout, GRU
-from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
 
 from tf_agents.environments import py_environment, tf_environment, tf_py_environment, utils, wrappers, suite_gym
 from tf_agents.specs import array_spec, tensor_spec
@@ -36,6 +37,8 @@ from tf_agents.drivers import py_driver, dynamic_step_driver
 from tf_agents.policies import py_tf_eager_policy, random_tf_policy, PolicySaver
 from tf_agents.metrics import tf_metrics
 import reverb
+
+from losses import generator_loss, discriminator_loss
 
 PAD = '| '
 version=10
@@ -389,6 +392,54 @@ def expand_dataset(filename:str) -> list[list]:
         dataset.append(combo)
     return dataset
 
+def tensor_to_image(tensor):
+    """Convert TensorFlow tensor into an image."""
+    tensor = tensor * 255
+    tensor = np.array(tensor, dtype=np.uint8)
+    if np.ndim(tensor) > 3:
+        assert tensor.shape[0] == 1
+        tensor = tensor[0]
+    return PIL.Image.fromarray(tensor)
+
+class DCGANTrainer:
+    """Custom Trainer for DCGAN models."""
+
+    def __init__(self, generator:Model, discriminator:Model, loss):
+        self.generator = generator
+        self.discriminator = discriminator
+        self.loss = loss
+        self.dopt = Adam(1e-4)
+        self.gopt = Adam(1e-4)
+
+    @tf.function
+    def train_step(self, images, batch_size, noise_dim):
+        noise = tf.random.normal([batch_size, noise_dim])
+        with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+            generated_images = generator(noise, training=True)
+
+            real_output = self.discriminator(images, training=True)
+            fake_output = self.discriminator(generated_images, training=True)
+
+            gen_loss = generator_loss(fake_output, self.loss)
+            disc_loss = discriminator_loss(real_output, fake_output, self.loss)
+
+        gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
+        gradients_of_discriminator = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+
+        self.gopt.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
+        self.dopt.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
+
+    def train(self, dataset, epochs:int):
+        for epoch in range(epochs):
+            start = time.time()
+
+            for image_batch in dataset:
+                self.train_step(image_batch)
+            # Save the model every 15 epochs
+        end = time.time()
+        print(f"Minutes taken to train the model: {(end - start) / 60}")
+
+
 class HangmanEnvironmentv1(py_environment.PyEnvironment):
     """This is the environment within the hangman game will be played."""
 
@@ -451,6 +502,7 @@ class HangmanEnvironmentv1(py_environment.PyEnvironment):
             discount = 1 / len(self.word)
             print("Failed {} times.".format(self.observation[-1]))
             return ts.transition(np.array(self.observation, dtype=np.int32), reward=0.0, discount = discount)
+
 
 class HangmanEnvironment(py_environment.PyEnvironment):
     def __init__(self, word_list:list):
