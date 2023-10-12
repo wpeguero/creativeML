@@ -22,7 +22,7 @@ import numpy as np
 
 import random
 
-from pipeline import clean_text, generate_sequences, version, HangmanEnvironment
+from pipeline import clean_text, generate_sequences, version, DCGANTrainer
 
 EPOCHS = 1_000
 BATCH= 32
@@ -30,7 +30,20 @@ BATCH= 32
 def _main():
     model = SimpleGenerator()
     model.build(input_shape=(None, 100))
-    plot_model(model, to_file='models/diagrams/generator.png')
+    discriminator = SimpleDiscriminator()
+    discriminator.build(input_shape=(None, 28, 28, 1))
+    plot_model(model, to_file='models/diagrams/generator_v{}.png'.format(version))
+    (train_images, train_labels), (_, _) = tf.keras.datasets.mnist.load_data()
+    train_images = train_images.reshape(train_images.shape[0], 28, 28, 1).astype('float32')
+    train_images = (train_images - 127.5) / 127.5 #Normalize images to [-1, 1]
+    train_dataset = tf.data.Dataset.from_tensor_slices(train_images).shuffle(60_000).batch(256)
+    loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+    trainer = DCGANTrainer(model, discriminator, loss, BATCH, 100)
+    trainer.train(train_dataset, 50)
+    gmodel = trainer.generator
+    dmodel = trainer.discriminator
+    gmodel.save("models/genmodel_{}".format(version))
+    dmodel.save("models/dismodel_{}".format(version))
 
 
 def text_generator(total_words:int, embedding_size:int, n_units:int):
