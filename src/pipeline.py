@@ -41,9 +41,14 @@ import reverb
 from losses import generator_loss, discriminator_loss
 
 PAD = '| '
-version=10
+version=3
 
 def _main():
+    pass
+
+
+def train_hangman():
+    """Temporary location for training hangman."""
     word_list = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape", "honeydew", "kiwi", "lemon"]
     #utils.validate_py_environment(environment, episodes=20) # Does not pass because the specs are not being followed through
     with open("data/words_250000_train.txt", 'r') as fp:
@@ -183,7 +188,6 @@ def _main():
     print("Time taken this loop (in minutes): {}".format(time_taken/60))
     saver = PolicySaver(agent.collect_policy, batch_size=None)
     saver.save("models/policy_{}".format(version))
-
 
 def compute_avg_return(environment, policy, num_episodes=10):
     total_return = 0.0
@@ -401,21 +405,31 @@ def tensor_to_image(tensor):
         tensor = tensor[0]
     return PIL.Image.fromarray(tensor)
 
+def load_image(filename:str):
+    """Load the image into a numpy Array."""
+    image = PIL.Image.open(filename)
+    image_array = np.asarray(image)
+    return image_array
+
+
 class DCGANTrainer:
     """Custom Trainer for DCGAN models."""
 
-    def __init__(self, generator:Model, discriminator:Model, loss):
+    def __init__(self, generator:Model, discriminator:Model, loss, batch_size:int, noise_dim:int):
         self.generator = generator
         self.discriminator = discriminator
         self.loss = loss
         self.dopt = Adam(1e-4)
         self.gopt = Adam(1e-4)
+        self.batch_size = batch_size
+        self.noise_dim = noise_dim
 
     @tf.function
-    def train_step(self, images, batch_size, noise_dim):
-        noise = tf.random.normal([batch_size, noise_dim])
+    def train_step(self, images):
+        """Singular training step."""
+        noise = tf.random.normal([self.batch_size, self.noise_dim])
         with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
-            generated_images = generator(noise, training=True)
+            generated_images = self.generator(noise, training=True)
 
             real_output = self.discriminator(images, training=True)
             fake_output = self.discriminator(generated_images, training=True)
@@ -423,16 +437,16 @@ class DCGANTrainer:
             gen_loss = generator_loss(fake_output, self.loss)
             disc_loss = discriminator_loss(real_output, fake_output, self.loss)
 
-        gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
-        gradients_of_discriminator = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+        gradients_of_generator = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
+        gradients_of_discriminator = disc_tape.gradient(disc_loss, self.discriminator.trainable_variables)
 
-        self.gopt.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
-        self.dopt.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
+        self.gopt.apply_gradients(zip(gradients_of_generator, self.generator.trainable_variables))
+        self.dopt.apply_gradients(zip(gradients_of_discriminator, self.discriminator.trainable_variables))
 
     def train(self, dataset, epochs:int):
+        """Train the machine learning model."""
+        start = time.time()
         for epoch in range(epochs):
-            start = time.time()
-
             for image_batch in dataset:
                 self.train_step(image_batch)
             # Save the model every 15 epochs
